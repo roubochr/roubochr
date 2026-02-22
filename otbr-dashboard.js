@@ -78,7 +78,7 @@ class OTBRCoreDashboard extends HTMLElement {
           border-radius: 10px;
           padding: 12px;
           background: rgba(125,125,125,0.05);
-          min-height: 250px;
+          min-height: 0;
         }
 
         .panel h3 {
@@ -91,13 +91,14 @@ class OTBRCoreDashboard extends HTMLElement {
 
         .network-wrap {
           position: relative;
-          min-height: 380px;
+          min-height: 0;
           overflow: hidden;
         }
 
         svg {
           width: 100%;
-          height: 380px;
+          height: auto;
+          aspect-ratio: 900 / 380;
           background: radial-gradient(circle at 20% 20%, rgba(0, 200, 255, 0.12), transparent 60%),
                       radial-gradient(circle at 80% 80%, rgba(150, 70, 255, 0.10), transparent 45%);
           border-radius: 8px;
@@ -137,6 +138,7 @@ class OTBRCoreDashboard extends HTMLElement {
           border: 1px solid var(--divider-color);
           border-radius: 8px;
           font-size: 12px;
+          -webkit-overflow-scrolling: touch;
         }
 
         .list table {
@@ -183,6 +185,74 @@ class OTBRCoreDashboard extends HTMLElement {
         @media (max-width: 1000px) {
           .grid {
             grid-template-columns: 1fr;
+          }
+        }
+
+        @media (max-width: 600px) {
+          ha-card {
+            padding: 10px;
+          }
+
+          .header {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 4px;
+            margin-bottom: 8px;
+          }
+
+          .header h2 {
+            font-size: 16px !important;
+          }
+
+          .status {
+            text-align: left;
+            font-size: 11px;
+          }
+
+          .grid {
+            gap: 8px;
+          }
+
+          .panel {
+            padding: 8px;
+            min-height: 0;
+          }
+
+          .panel h3 {
+            font-size: 12px;
+            margin-bottom: 4px;
+          }
+
+          svg {
+            aspect-ratio: 900 / 300;
+          }
+
+          .legend {
+            font-size: 10px;
+            gap: 6px;
+            margin-top: 4px;
+          }
+
+          .list {
+            max-height: 140px;
+            font-size: 11px;
+          }
+
+          .list th,
+          .list td {
+            padding: 4px;
+            font-size: 11px;
+          }
+
+          .logs {
+            font-size: 11px;
+            max-height: 150px;
+          }
+
+          .debug pre {
+            font-size: 10px;
+            max-height: 200px;
+            padding: 6px;
           }
         }
       </style>
@@ -278,6 +348,75 @@ class OTBRCoreDashboard extends HTMLElement {
   }
 
   async _fetchDiagnostics() {
+    // Strategy 1: Home Assistant WebSocket API (most reliable — bypasses CORS and network)
+    if (this._hass) {
+      const wsStrategies = [
+        { type: "otbr/info", label: "ws:otbr/info" },
+        { type: "thread/list_border_agents", label: "ws:thread/list_border_agents" },
+      ];
+
+      for (const ws of wsStrategies) {
+        try {
+          this._debug(`Trying WS: ${ws.type}`);
+          const result = await this._hass.callWS({ type: ws.type });
+          if (result) {
+            this._debug(`WS ${ws.type} succeeded`, result);
+            return { ok: true, endpoint: ws.label, data: result };
+          }
+        } catch (e) {
+          this._debug(`WS ${ws.type} failed`, e);
+        }
+      }
+
+      // Try fetching OTBR config entry diagnostics via WS
+      try {
+        this._debug("Trying WS: config_entries/get for otbr");
+        const entries = await this._hass.callWS({ type: "config_entries/get" });
+        const otbrEntry = (entries || []).find(
+          (e) => e.domain === "otbr" || e.domain === "openthread_border_router"
+        );
+        if (otbrEntry) {
+          this._debug(`Found OTBR config entry: ${otbrEntry.entry_id}`);
+          const token = this._hass.auth?.data?.access_token;
+          if (token) {
+            const diagRes = await fetch(
+              `/api/diagnostics/config_entry/${otbrEntry.entry_id}`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            if (diagRes.ok) {
+              const diagData = await diagRes.json();
+              this._debug("Config entry diagnostics succeeded", diagData);
+              return { ok: true, endpoint: `diag:${otbrEntry.entry_id}`, data: diagData?.data || diagData };
+            }
+          }
+        }
+      } catch (e) {
+        this._debug("Config entry diagnostics failed", e);
+      }
+    }
+
+    // Strategy 2: Home Assistant REST API (authenticated, proxied through HA)
+    if (this._hass) {
+      const restPaths = [
+        "otbr/info",
+        "hassio/addons/core_openthread_border_router/info",
+      ];
+
+      for (const path of restPaths) {
+        try {
+          this._debug(`Trying HA REST: ${path}`);
+          const result = await this._hass.callApi("GET", path);
+          if (result) {
+            this._debug(`HA REST ${path} succeeded`, result);
+            return { ok: true, endpoint: `rest:${path}`, data: result?.data || result };
+          }
+        } catch (e) {
+          this._debug(`HA REST ${path} failed`, e);
+        }
+      }
+    }
+
+    // Strategy 3: Direct HTTP fetch (original fallback for custom proxy setups)
     const endpoints = this._config.diagnostics_paths || [];
     const token = this._hass?.auth?.data?.access_token;
 
@@ -289,7 +428,7 @@ class OTBRCoreDashboard extends HTMLElement {
 
         if (token) headers.Authorization = `Bearer ${token}`;
 
-        this._debug(`Trying endpoint: ${endpoint}`);
+        this._debug(`Trying direct fetch: ${endpoint}`);
         const res = await fetch(endpoint, {
           method: "GET",
           headers,
@@ -310,37 +449,46 @@ class OTBRCoreDashboard extends HTMLElement {
           throw new Error(`HTTP ${res.status} @ ${endpoint}: ${text?.slice(0, 500)}`);
         }
 
-        this._debug(`Endpoint ok: ${endpoint}`, data);
+        this._debug(`Direct fetch ok: ${endpoint}`, data);
         return { ok: true, endpoint, data };
       } catch (error) {
-        this._debug(`Endpoint failed: ${endpoint}`, error);
+        this._debug(`Direct fetch failed: ${endpoint}`, error);
         this._appendLog("warn", `Fetch failed for ${endpoint}`, String(error));
       }
     }
 
-    return { ok: false, error: "No diagnostics endpoint responded." };
+    return { ok: false, error: "No diagnostics endpoint responded. Tried HA WebSocket API, HA REST API, and direct HTTP endpoints." };
   }
 
   _parseTopology(data) {
-    const source = data?.topology || data?.thread_network || data || {};
-    const leaderId = source.leader_id || source.leader || source.rloc16;
+    // Handle HA diagnostics wrapper: { data: { ... } } or { home_assistant: {}, data: { ... } }
+    const unwrapped = data?.data || data;
+
+    // Handle HA OTBR info format: { active_dataset_tlvs, channel, extended_address, ... }
+    // Handle raw OTBR REST format: { topology: { ... } } or { thread_network: { ... } }
+    // Handle HA addon info format: { data: { ... } }
+    const source = unwrapped?.topology || unwrapped?.thread_network || unwrapped || {};
+    const leaderId = source.leader_id || source.leader || source.rloc16 || unwrapped?.extended_address;
 
     const routers = source.routers || source.router_table || [];
     const children = source.children || source.child_table || [];
+
+    // Handle HA border_agents format from thread/list_border_agents
+    const borderAgents = unwrapped?.border_agents || source.border_agents || [];
 
     const nodes = [];
     const links = [];
 
     const normalizeNode = (raw, roleHint) => {
       const id = String(
-        raw.id || raw.ext_address || raw.eui64 || raw.rloc16 || raw.rloc || raw.address || raw.name || Math.random()
+        raw.id || raw.extended_address || raw.ext_address || raw.eui64 || raw.rloc16 || raw.rloc || raw.address || raw.name || Math.random()
       );
       const role = (raw.role || roleHint || "child").toLowerCase();
       const signal = Number(raw.rssi ?? raw.signal ?? raw.avg_rssi ?? raw.link_quality ?? NaN);
       const online = raw.online ?? raw.is_online ?? raw.state !== "offline";
       return {
         id,
-        label: raw.name || raw.hostname || raw.device || id.slice(0, 12),
+        label: raw.name || raw.hostname || raw.device || raw.brand_name || id.slice(0, 12),
         role,
         parent: raw.parent || raw.parent_id || raw.parent_rloc || null,
         signal: Number.isFinite(signal) ? signal : null,
@@ -352,12 +500,28 @@ class OTBRCoreDashboard extends HTMLElement {
     for (const router of routers) nodes.push(normalizeNode(router, "router"));
     for (const child of children) nodes.push(normalizeNode(child, "child"));
 
+    // Parse border agents from HA thread integration
+    for (const agent of borderAgents) {
+      nodes.push(normalizeNode(agent, agent.is_leader ? "leader" : "router"));
+    }
+
     if (!nodes.length && Array.isArray(source.nodes)) {
       for (const n of source.nodes) nodes.push(normalizeNode(n, n.role));
     }
 
     if (!nodes.length && source.node) {
       nodes.push(normalizeNode(source.node, source.node.role || "leader"));
+    }
+
+    // If we got HA OTBR info with extended_address but no nodes, create a leader node from it
+    if (!nodes.length && unwrapped?.extended_address) {
+      nodes.push(normalizeNode({
+        id: unwrapped.extended_address,
+        extended_address: unwrapped.extended_address,
+        name: unwrapped.url || "OTBR Leader",
+        role: "leader",
+        channel: unwrapped.channel,
+      }, "leader"));
     }
 
     nodes.forEach((n) => {
